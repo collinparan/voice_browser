@@ -4,6 +4,7 @@
   <meta charset="utf-8"/>
   <title>Ultra-fast WebGPU Voice (Whisper + Native TTS)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
+
   <style>
     :root{ --glass: rgba(0,0,0,.52); --blur: 12px; --radius: 16px; --accent:#3fb950; --muted:#c9c9c9; --danger:#e5534b; }
     *{ box-sizing:border-box; }
@@ -27,6 +28,7 @@
 
     #left{ position:fixed; left:24px; bottom:24px; display:flex; flex-direction:column; gap:14px; max-width:560px; z-index:4; }
     #right{ position:fixed; right:24px; bottom:24px; width:min(600px,46vw); display:flex; flex-direction:column; gap:14px; z-index:4; }
+
     .panel{ background:var(--glass); backdrop-filter:blur(var(--blur)); border-radius:var(--radius); padding:16px 18px; color:#fff;
       box-shadow:0 4px 30px rgba(0,0,0,.25); }
     .panel h4{ margin:0 0 10px 0; opacity:.92; letter-spacing:.2px; font-weight:950; }
@@ -37,13 +39,17 @@
     .row{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     .pill{ display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px;
       border:1px solid rgba(255,255,255,.16); background:rgba(255,255,255,.06); font-weight:900; font-size:12px; opacity:.95; }
+
+    input[type="range"]{ width:220px; }
     @media (max-width:900px){ #left{ max-width:420px; } #right{ width: calc(100vw - 48px);} }
   </style>
 
+  <!-- transformers.js -->
   <script type="importmap">
   { "imports": { "@huggingface/transformers": "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2" } }
   </script>
 </head>
+
 <body>
   <div class="bg"></div>
 
@@ -63,13 +69,27 @@
       <h4>Speed-first settings</h4>
       <div class="row">
         <span class="pill">ASR: <span class="mono">whisper-tiny.en</span></span>
-        <span class="pill">Window: <span class="mono" id="winLabel">0.8s</span></span>
-        <span class="pill">Step: <span class="mono" id="stepLabel">300ms</span></span>
         <span class="pill">TTS: <span class="mono">speechSynthesis</span></span>
+        <span class="pill">Sample rate: <span class="mono">16kHz</span></span>
       </div>
+
+      <div class="row" style="margin-top:12px">
+        <span class="pill">Window <span class="mono" id="winLabel">0.8s</span></span>
+        <input id="winRange" type="range" min="0.6" max="1.4" step="0.1" value="0.8">
+        <span class="pill">Step <span class="mono" id="stepLabel">300ms</span></span>
+        <input id="stepRange" type="range" min="200" max="900" step="50" value="300">
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <span class="pill">Finalize silence <span class="mono" id="silLabel">650ms</span></span>
+        <input id="silRange" type="range" min="350" max="1400" step="50" value="650">
+        <span class="pill">VAD thresh <span class="mono" id="vadLabel">0.015</span></span>
+        <input id="vadRange" type="range" min="0.006" max="0.05" step="0.001" value="0.015">
+      </div>
+
       <div class="small" style="margin-top:10px">
-        This uses rolling-window Whisper for partial text, then responds with ultra-fast native TTS.
-        This is the lowest perceived latency you’ll get in-browser on Chrome/Mac.
+        This is “streaming-ish”: it runs Whisper every step on the most recent audio window and updates partial text quickly.
+        When you pause speaking, it finalizes and speaks a response. This build fixes the “Float32Array vs Object” Whisper input bug.
       </div>
     </div>
 
@@ -84,6 +104,7 @@
       <h4>Live transcript</h4>
       <div id="live" class="big">—</div>
       <div class="small">Updates while you speak.</div>
+      <div class="small mono" id="typeLine" style="margin-top:8px; opacity:.75">ASR input: —</div>
     </div>
     <div class="panel">
       <h4>Assistant reply</h4>
@@ -99,6 +120,7 @@ const $ = (id) => document.getElementById(id);
 const logEl = $("log");
 const liveEl = $("live");
 const replyEl = $("reply");
+const typeLine = $("typeLine");
 
 const gpuDot = $("gpuDot"), gpuLabel = $("gpuLabel");
 const micDot = $("micDot"), micLabel = $("micLabel");
@@ -108,6 +130,15 @@ const ttsDot = $("ttsDot"), ttsLabel = $("ttsLabel");
 const initBtn = $("initBtn");
 const listenBtn = $("listenBtn");
 const stopBtn = $("stopBtn");
+
+const winRange = $("winRange");
+const stepRange = $("stepRange");
+const silRange = $("silRange");
+const vadRange = $("vadRange");
+const winLabel = $("winLabel");
+const stepLabel = $("stepLabel");
+const silLabel = $("silLabel");
+const vadLabel = $("vadLabel");
 
 function log(msg) {
   const t = new Date().toLocaleTimeString();
@@ -126,22 +157,42 @@ env.allowLocalModels = false;
 
 let asr = null;
 
-// --- Speed knobs ---
+// ---------- Speed knobs (live adjustable) ----------
 const TARGET_SR = 16000;
-const WINDOW_SEC = 0.8;
-const STEP_MS = 300;
-const SILENCE_MS_TO_FINAL = 650;     // tighter -> faster finalize
-const MIN_FINAL_CHARS = 6;           // avoid speaking on accidental noise
+let WINDOW_SEC = parseFloat(winRange.value);
+let STEP_MS = parseInt(stepRange.value, 10);
+let SILENCE_MS_TO_FINAL = parseInt(silRange.value, 10);
+let VAD_THRESH = parseFloat(vadRange.value);
 
-$("winLabel").textContent = `${WINDOW_SEC.toFixed(1)}s`;
-$("stepLabel").textContent = `${STEP_MS}ms`;
+function syncKnobs(){
+  WINDOW_SEC = parseFloat(winRange.value);
+  STEP_MS = parseInt(stepRange.value, 10);
+  SILENCE_MS_TO_FINAL = parseInt(silRange.value, 10);
+  VAD_THRESH = parseFloat(vadRange.value);
 
-// --- Audio capture ---
+  winLabel.textContent = `${WINDOW_SEC.toFixed(1)}s`;
+  stepLabel.textContent = `${STEP_MS}ms`;
+  silLabel.textContent = `${SILENCE_MS_TO_FINAL}ms`;
+  vadLabel.textContent = `${VAD_THRESH.toFixed(3)}`;
+
+  // If running, resize ring buffer (safe reset)
+  if (running) {
+    log("Knobs changed; resetting buffers.");
+    resetRing();
+  }
+}
+winRange.oninput = syncKnobs;
+stepRange.oninput = () => { syncKnobs(); if (running) restartTimer(); };
+silRange.oninput = syncKnobs;
+vadRange.oninput = syncKnobs;
+syncKnobs();
+
+// ---------- Audio capture ----------
 let audioCtx = null;
 let workletNode = null;
 let micStream = null;
 
-let ring = new Float32Array(Math.ceil(TARGET_SR * WINDOW_SEC));
+let ring = null;
 let ringWrite = 0;
 let haveSamples = 0;
 
@@ -152,27 +203,32 @@ let stepTimer = null;
 let inFlight = false;
 let speaking = false;
 
-// crude VAD
-function rms(buf) {
-  let s = 0;
-  for (let i = 0; i < buf.length; i++) s += buf[i]*buf[i];
-  return Math.sqrt(s / buf.length);
-}
-function getWindow() {
-  const out = new Float32Array(ring.length);
-  const len = ring.length;
-  const start = (ringWrite - len + ring.length) % ring.length;
-  for (let i = 0; i < len; i++) out[i] = ring[(start + i) % ring.length];
-  return out;
-}
-function clearState() {
-  ring.fill(0);
+function resetRing(){
+  ring = new Float32Array(Math.ceil(TARGET_SR * WINDOW_SEC));
   ringWrite = 0;
   haveSamples = 0;
   lastHeardAt = 0;
   lastPartial = "";
   liveEl.textContent = "—";
   replyEl.textContent = "—";
+  typeLine.textContent = "ASR input: —";
+}
+
+resetRing();
+
+function rms(buf) {
+  let s = 0;
+  for (let i = 0; i < buf.length; i++) s += buf[i]*buf[i];
+  return Math.sqrt(s / buf.length);
+}
+
+// ALWAYS return Float32Array
+function getWindow() {
+  const len = ring.length;
+  const out = new Float32Array(len);
+  const start = (ringWrite - len + ring.length) % ring.length;
+  for (let i = 0; i < len; i++) out[i] = ring[(start + i) % ring.length];
+  return out;
 }
 
 function stopAllSpeech() {
@@ -186,11 +242,10 @@ function speakFast(text) {
   if (!text) return;
 
   const u = new SpeechSynthesisUtterance(text);
-  u.rate = 1.12;      // faster without sounding too chipmunk
+  u.rate = 1.12;
   u.pitch = 1.0;
   u.volume = 1.0;
 
-  // pick an English voice if available
   const voices = speechSynthesis.getVoices?.() || [];
   const v = voices.find(v => /en-US|en_US|English/i.test(v.lang || v.name)) || voices[0];
   if (v) u.voice = v;
@@ -202,7 +257,7 @@ function speakFast(text) {
   speechSynthesis.speak(u);
 }
 
-// ultra-fast “brain”: intent-ish rules (no LLM)
+// Ultra-fast “brain” (no LLM)
 function respond(text) {
   const t = (text || "").trim();
   if (!t) return "I didn’t catch that.";
@@ -210,12 +265,11 @@ function respond(text) {
 
   if (low.includes("hello") || low.includes("hey")) return "Hey. What’s up?";
   if (low.includes("time")) return `It’s ${new Date().toLocaleTimeString()}.`;
-  if (low.includes("weather")) return "If you want weather, tell me your city.";
-  if (low.startsWith("open")) return "Tell me what you want to open.";
   if (low.includes("stop")) return "Okay. Stopping.";
+  if (low.includes("weather")) return "Tell me your city for weather.";
 
-  // default: echo + short acknowledgement (keeps it snappy)
-  if (t.length <= 60) return `Got it: ${t}`;
+  // keep it short & snappy
+  if (t.length <= 70) return `Got it: ${t}`;
   return "Got it.";
 }
 
@@ -230,12 +284,13 @@ async function initModels() {
     );
     setASR("ready");
     log("ASR ready (whisper-tiny.en).");
-    listenBtn.disabled = false;
-    stopBtn.disabled = false;
 
-    // warm speech synthesis voices
+    // warm voices
     try { speechSynthesis.getVoices(); } catch {}
     setTTS("idle");
+
+    listenBtn.disabled = false;
+    stopBtn.disabled = false;
   } catch (e) {
     log("Init error: " + (e?.message || e));
     initBtn.disabled = false;
@@ -245,6 +300,7 @@ async function initModels() {
 
 async function ensureAudioWorklet() {
   if (audioCtx) return;
+
   audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: TARGET_SR });
 
   const code = `
@@ -264,18 +320,25 @@ async function ensureAudioWorklet() {
   workletNode = new AudioWorkletNode(audioCtx, "capture");
   workletNode.port.onmessage = (e) => {
     if (!running) return;
-    const frame = e.data;
+    const frame = e.data; // Float32Array
 
+    // write to ring buffer
     for (let i = 0; i < frame.length; i++) {
       ring[ringWrite] = frame[i];
       ringWrite = (ringWrite + 1) % ring.length;
     }
     haveSamples = Math.min(ring.length, haveSamples + frame.length);
 
-    if (rms(frame) > 0.015) lastHeardAt = performance.now();
+    // VAD energy threshold
+    if (rms(frame) > VAD_THRESH) lastHeardAt = performance.now();
   };
 
   log("AudioWorklet ready @16kHz.");
+}
+
+function restartTimer(){
+  if (stepTimer) { clearInterval(stepTimer); stepTimer = null; }
+  if (running) stepTimer = setInterval(tick, STEP_MS);
 }
 
 async function start() {
@@ -288,37 +351,49 @@ async function start() {
   micStream = await navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
   });
+
   const source = audioCtx.createMediaStreamSource(micStream);
   source.connect(workletNode);
 
-  clearState();
+  resetRing();
+
   running = true;
   setMic(true);
   setASR("listening…");
   log("Started.");
-
-  stepTimer = setInterval(tick, STEP_MS);
+  restartTimer();
 }
 
 async function stop() {
   running = false;
+
+  // IMPORTANT: clear timer first to stop ASR calls immediately
+  if (stepTimer) { clearInterval(stepTimer); stepTimer = null; }
+
   setMic(false);
   setASR("idle");
-  if (stepTimer) { clearInterval(stepTimer); stepTimer = null; }
+  stopAllSpeech();
+
   try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch {}
   micStream = null;
-  stopAllSpeech();
+
   log("Stopped.");
 }
 
 async function tick() {
-  if (!running || inFlight || haveSamples < ring.length || speaking) return;
-  inFlight = true;
+  if (!running || inFlight || speaking) return;
+  if (!ring || haveSamples < ring.length) return; // need full window
 
+  inFlight = true;
   try {
     setASR("decoding…");
-    const windowAudio = getWindow();
+
+    const windowAudio = getWindow(); // Float32Array guaranteed
+    typeLine.textContent = `ASR input: ${windowAudio.constructor.name} len=${windowAudio.length}`;
+
+    // ✅ Correct transformers.js signature: audio array first, options second
     const result = await asr(windowAudio, { sampling_rate: TARGET_SR });
+
     const text = (result?.text || "").trim();
 
     if (text && text !== lastPartial) {
@@ -329,24 +404,21 @@ async function tick() {
     const now = performance.now();
     const quietLongEnough = lastHeardAt && (now - lastHeardAt) > SILENCE_MS_TO_FINAL;
 
-    if (quietLongEnough && lastPartial && lastPartial.length >= MIN_FINAL_CHARS) {
+    if (quietLongEnough && lastPartial && lastPartial.length >= 6) {
       const finalText = lastPartial;
       log("Final: " + finalText);
 
-      setASR("ready");
       const r = respond(finalText);
       replyEl.textContent = r;
-
       speakFast(r);
 
       // reset for next utterance
       lastPartial = "";
       liveEl.textContent = "—";
       lastHeardAt = 0;
-      setASR("listening…");
-    } else {
-      setASR("listening…");
     }
+
+    setASR("listening…");
   } catch (e) {
     log("ASR error: " + (e?.message || e));
     setASR("listening…");
