@@ -4,6 +4,7 @@
   <meta charset="utf-8"/>
   <title>Ultra-fast WebGPU Voice (Whisper + Native TTS)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <link rel="icon" href="data:,">
 
   <style>
     :root{ --glass: rgba(0,0,0,.52); --blur: 12px; --radius: 16px; --accent:#3fb950; --muted:#c9c9c9; --danger:#e5534b; }
@@ -94,8 +95,7 @@
       </div>
 
       <div class="small" style="margin-top:10px">
-        Fix for <span class="mono">[BLANK_AUDIO]</span>: capture at the browser native mic rate (usually 48kHz) and resample to 16kHz before Whisper.
-        Watch the mic meter — if it stays near 0 while you talk, Chrome isn’t getting audio from your selected input device.
+        Capture at native mic rate and resample to 16kHz before Whisper. Watch the mic meter.
       </div>
     </div>
 
@@ -115,7 +115,7 @@
     <div class="panel">
       <h4>Assistant reply</h4>
       <div id="reply" class="big">—</div>
-      <div class="small">Spoken immediately using the OS voice.</div>
+      <div class="small">Spoken using the OS voice.</div>
     </div>
   </div>
 
@@ -166,8 +166,11 @@ env.allowLocalModels = false;
 
 let asr = null;
 
+// ✅ declare running BEFORE syncKnobs so there is no temporal-dead-zone crash
+let running = false;
+
 // ---------- knobs ----------
-const ASR_SR = 16000; // Whisper input we feed
+const ASR_SR = 16000;
 let WINDOW_SEC = parseFloat(winRange.value);
 let STEP_MS = parseInt(stepRange.value, 10);
 let SILENCE_MS_TO_FINAL = parseInt(silRange.value, 10);
@@ -187,27 +190,27 @@ function syncKnobs(){
   if (running) {
     log("Knobs changed; resetting buffers.");
     resetRing();
+    restartTimer();
   }
 }
 winRange.oninput = syncKnobs;
-stepRange.oninput = () => { syncKnobs(); if (running) restartTimer(); };
+stepRange.oninput = syncKnobs;
 silRange.oninput = syncKnobs;
 vadRange.oninput = syncKnobs;
 syncKnobs();
 
-// ---------- audio capture at native rate ----------
+// ---------- audio capture ----------
 let audioCtx = null;
 let workletNode = null;
 let micStream = null;
 
-let NATIVE_SR = 48000; // will update
+let NATIVE_SR = 48000;
 let ring = null;
 let ringWrite = 0;
 let haveSamples = 0;
 
 let lastHeardAt = 0;
 let lastPartial = "";
-let running = false;
 let stepTimer = null;
 let inFlight = false;
 let speaking = false;
@@ -216,7 +219,6 @@ let speaking = false;
 let lastFrameRms = 0;
 
 function resetRing(){
-  // ring is in native sample rate
   ring = new Float32Array(Math.ceil(NATIVE_SR * WINDOW_SEC));
   ringWrite = 0;
   haveSamples = 0;
@@ -238,7 +240,6 @@ function getNativeWindow() {
   for (let i = 0; i < len; i++) out[i] = ring[(start + i) % ring.length];
   return out;
 }
-// Linear resampler: native -> 16k
 function resampleLinear(input, inRate, outRate) {
   if (inRate === outRate) return input;
   const ratio = inRate / outRate;
@@ -319,7 +320,6 @@ async function initModels() {
 async function ensureAudioWorklet() {
   if (audioCtx) return;
 
-  // Let Chrome choose its native rate (usually 48000)
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   NATIVE_SR = audioCtx.sampleRate;
   nativeSrEl.textContent = `${NATIVE_SR}Hz`;
@@ -342,20 +342,17 @@ async function ensureAudioWorklet() {
   workletNode = new AudioWorkletNode(audioCtx, "capture");
   workletNode.port.onmessage = (e) => {
     if (!running) return;
-    const frame = e.data; // Float32Array at NATIVE_SR
+    const frame = e.data;
 
-    // mic meter
     lastFrameRms = rms(frame);
-    micMeter.value = Math.min(1, lastFrameRms * 12); // scale for UI
+    micMeter.value = Math.min(1, lastFrameRms * 12);
 
-    // write to ring
     for (let i = 0; i < frame.length; i++) {
       ring[ringWrite] = frame[i];
       ringWrite = (ringWrite + 1) % ring.length;
     }
     haveSamples = Math.min(ring.length, haveSamples + frame.length);
 
-    // VAD
     if (lastFrameRms > VAD_THRESH) lastHeardAt = performance.now();
   };
 
@@ -381,7 +378,6 @@ async function start() {
   source.connect(workletNode);
 
   resetRing();
-
   running = true;
   setMic(true);
   setASR("listening…");
@@ -411,16 +407,14 @@ async function tick() {
   try {
     setASR("decoding…");
 
-    const nativeWindow = getNativeWindow(); // Float32Array @ NATIVE_SR
-    const windowAudio = resampleLinear(nativeWindow, NATIVE_SR, ASR_SR); // Float32Array @ 16k
+    const nativeWindow = getNativeWindow();
+    const windowAudio = resampleLinear(nativeWindow, NATIVE_SR, ASR_SR);
 
-    typeLine.textContent = `ASR input: ${windowAudio.constructor.name} len=${windowAudio.length} (from ${NATIVE_SR}→${ASR_SR})`;
+    typeLine.textContent = `ASR input: ${windowAudio.constructor.name} len=${windowAudio.length} (${NATIVE_SR}→${ASR_SR})`;
 
-    // Correct signature: audio array first
     const result = await asr(windowAudio, { sampling_rate: ASR_SR });
     const text = (result?.text || "").trim();
 
-    // ignore pure blank audio tokens
     const meaningful = text && text !== "[BLANK_AUDIO]" && text !== "[blank_audio]";
 
     if (meaningful && text !== lastPartial) {
@@ -431,7 +425,6 @@ async function tick() {
     const now = performance.now();
     const quietLongEnough = lastHeardAt && (now - lastHeardAt) > SILENCE_MS_TO_FINAL;
 
-    // Only finalize if we actually heard non-trivial text
     if (quietLongEnough && meaningful && lastPartial.length >= 6) {
       const finalText = lastPartial;
       log("Final: " + finalText);
