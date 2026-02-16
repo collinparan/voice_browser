@@ -41,10 +41,10 @@
       border:1px solid rgba(255,255,255,.16); background:rgba(255,255,255,.06); font-weight:900; font-size:12px; opacity:.95; }
 
     input[type="range"]{ width:220px; }
+    progress{ width:240px; height:12px; }
     @media (max-width:900px){ #left{ max-width:420px; } #right{ width: calc(100vw - 48px);} }
   </style>
 
-  <!-- transformers.js -->
   <script type="importmap">
   { "imports": { "@huggingface/transformers": "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2" } }
   </script>
@@ -70,26 +70,32 @@
       <div class="row">
         <span class="pill">ASR: <span class="mono">whisper-tiny.en</span></span>
         <span class="pill">TTS: <span class="mono">speechSynthesis</span></span>
-        <span class="pill">Sample rate: <span class="mono">16kHz</span></span>
+        <span class="pill">ASR SR: <span class="mono">16kHz</span></span>
       </div>
 
       <div class="row" style="margin-top:12px">
-        <span class="pill">Window <span class="mono" id="winLabel">0.8s</span></span>
-        <input id="winRange" type="range" min="0.6" max="1.4" step="0.1" value="0.8">
-        <span class="pill">Step <span class="mono" id="stepLabel">300ms</span></span>
-        <input id="stepRange" type="range" min="200" max="900" step="50" value="300">
+        <span class="pill">Window <span class="mono" id="winLabel">1.0s</span></span>
+        <input id="winRange" type="range" min="0.8" max="1.8" step="0.1" value="1.0">
+        <span class="pill">Step <span class="mono" id="stepLabel">350ms</span></span>
+        <input id="stepRange" type="range" min="250" max="900" step="50" value="350">
       </div>
 
       <div class="row" style="margin-top:12px">
-        <span class="pill">Finalize silence <span class="mono" id="silLabel">650ms</span></span>
-        <input id="silRange" type="range" min="350" max="1400" step="50" value="650">
-        <span class="pill">VAD thresh <span class="mono" id="vadLabel">0.015</span></span>
-        <input id="vadRange" type="range" min="0.006" max="0.05" step="0.001" value="0.015">
+        <span class="pill">Finalize silence <span class="mono" id="silLabel">800ms</span></span>
+        <input id="silRange" type="range" min="450" max="1600" step="50" value="800">
+        <span class="pill">VAD thresh <span class="mono" id="vadLabel">0.020</span></span>
+        <input id="vadRange" type="range" min="0.010" max="0.060" step="0.001" value="0.020">
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <span class="pill">Mic level</span>
+        <progress id="micMeter" max="1" value="0"></progress>
+        <span class="pill">Native SR <span class="mono" id="nativeSr">—</span></span>
       </div>
 
       <div class="small" style="margin-top:10px">
-        This is “streaming-ish”: it runs Whisper every step on the most recent audio window and updates partial text quickly.
-        When you pause speaking, it finalizes and speaks a response. This build fixes the “Float32Array vs Object” Whisper input bug.
+        Fix for <span class="mono">[BLANK_AUDIO]</span>: capture at the browser native mic rate (usually 48kHz) and resample to 16kHz before Whisper.
+        Watch the mic meter — if it stays near 0 while you talk, Chrome isn’t getting audio from your selected input device.
       </div>
     </div>
 
@@ -140,6 +146,9 @@ const stepLabel = $("stepLabel");
 const silLabel = $("silLabel");
 const vadLabel = $("vadLabel");
 
+const micMeter = $("micMeter");
+const nativeSrEl = $("nativeSr");
+
 function log(msg) {
   const t = new Date().toLocaleTimeString();
   logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
@@ -157,8 +166,8 @@ env.allowLocalModels = false;
 
 let asr = null;
 
-// ---------- Speed knobs (live adjustable) ----------
-const TARGET_SR = 16000;
+// ---------- knobs ----------
+const ASR_SR = 16000; // Whisper input we feed
 let WINDOW_SEC = parseFloat(winRange.value);
 let STEP_MS = parseInt(stepRange.value, 10);
 let SILENCE_MS_TO_FINAL = parseInt(silRange.value, 10);
@@ -175,7 +184,6 @@ function syncKnobs(){
   silLabel.textContent = `${SILENCE_MS_TO_FINAL}ms`;
   vadLabel.textContent = `${VAD_THRESH.toFixed(3)}`;
 
-  // If running, resize ring buffer (safe reset)
   if (running) {
     log("Knobs changed; resetting buffers.");
     resetRing();
@@ -187,11 +195,12 @@ silRange.oninput = syncKnobs;
 vadRange.oninput = syncKnobs;
 syncKnobs();
 
-// ---------- Audio capture ----------
+// ---------- audio capture at native rate ----------
 let audioCtx = null;
 let workletNode = null;
 let micStream = null;
 
+let NATIVE_SR = 48000; // will update
 let ring = null;
 let ringWrite = 0;
 let haveSamples = 0;
@@ -203,8 +212,12 @@ let stepTimer = null;
 let inFlight = false;
 let speaking = false;
 
+// Track mic level
+let lastFrameRms = 0;
+
 function resetRing(){
-  ring = new Float32Array(Math.ceil(TARGET_SR * WINDOW_SEC));
+  // ring is in native sample rate
+  ring = new Float32Array(Math.ceil(NATIVE_SR * WINDOW_SEC));
   ringWrite = 0;
   haveSamples = 0;
   lastHeardAt = 0;
@@ -213,21 +226,31 @@ function resetRing(){
   replyEl.textContent = "—";
   typeLine.textContent = "ASR input: —";
 }
-
-resetRing();
-
 function rms(buf) {
   let s = 0;
   for (let i = 0; i < buf.length; i++) s += buf[i]*buf[i];
   return Math.sqrt(s / buf.length);
 }
-
-// ALWAYS return Float32Array
-function getWindow() {
+function getNativeWindow() {
   const len = ring.length;
   const out = new Float32Array(len);
   const start = (ringWrite - len + ring.length) % ring.length;
   for (let i = 0; i < len; i++) out[i] = ring[(start + i) % ring.length];
+  return out;
+}
+// Linear resampler: native -> 16k
+function resampleLinear(input, inRate, outRate) {
+  if (inRate === outRate) return input;
+  const ratio = inRate / outRate;
+  const outLen = Math.floor(input.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const x = i * ratio;
+    const x0 = Math.floor(x);
+    const x1 = Math.min(x0 + 1, input.length - 1);
+    const t = x - x0;
+    out[i] = input[x0] * (1 - t) + input[x1] * t;
+  }
   return out;
 }
 
@@ -236,7 +259,6 @@ function stopAllSpeech() {
   speaking = false;
   setTTS("idle");
 }
-
 function speakFast(text) {
   stopAllSpeech();
   if (!text) return;
@@ -257,18 +279,15 @@ function speakFast(text) {
   speechSynthesis.speak(u);
 }
 
-// Ultra-fast “brain” (no LLM)
+// Ultra-fast rule “brain”
 function respond(text) {
   const t = (text || "").trim();
   if (!t) return "I didn’t catch that.";
   const low = t.toLowerCase();
-
   if (low.includes("hello") || low.includes("hey")) return "Hey. What’s up?";
   if (low.includes("time")) return `It’s ${new Date().toLocaleTimeString()}.`;
   if (low.includes("stop")) return "Okay. Stopping.";
   if (low.includes("weather")) return "Tell me your city for weather.";
-
-  // keep it short & snappy
   if (t.length <= 70) return `Got it: ${t}`;
   return "Got it.";
 }
@@ -285,7 +304,6 @@ async function initModels() {
     setASR("ready");
     log("ASR ready (whisper-tiny.en).");
 
-    // warm voices
     try { speechSynthesis.getVoices(); } catch {}
     setTTS("idle");
 
@@ -301,7 +319,11 @@ async function initModels() {
 async function ensureAudioWorklet() {
   if (audioCtx) return;
 
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: TARGET_SR });
+  // Let Chrome choose its native rate (usually 48000)
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  NATIVE_SR = audioCtx.sampleRate;
+  nativeSrEl.textContent = `${NATIVE_SR}Hz`;
+  resetRing();
 
   const code = `
     class Capture extends AudioWorkletProcessor {
@@ -320,20 +342,24 @@ async function ensureAudioWorklet() {
   workletNode = new AudioWorkletNode(audioCtx, "capture");
   workletNode.port.onmessage = (e) => {
     if (!running) return;
-    const frame = e.data; // Float32Array
+    const frame = e.data; // Float32Array at NATIVE_SR
 
-    // write to ring buffer
+    // mic meter
+    lastFrameRms = rms(frame);
+    micMeter.value = Math.min(1, lastFrameRms * 12); // scale for UI
+
+    // write to ring
     for (let i = 0; i < frame.length; i++) {
       ring[ringWrite] = frame[i];
       ringWrite = (ringWrite + 1) % ring.length;
     }
     haveSamples = Math.min(ring.length, haveSamples + frame.length);
 
-    // VAD energy threshold
-    if (rms(frame) > VAD_THRESH) lastHeardAt = performance.now();
+    // VAD
+    if (lastFrameRms > VAD_THRESH) lastHeardAt = performance.now();
   };
 
-  log("AudioWorklet ready @16kHz.");
+  log(`AudioWorklet ready @ native ${NATIVE_SR}Hz.`);
 }
 
 function restartTimer(){
@@ -351,7 +377,6 @@ async function start() {
   micStream = await navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
   });
-
   const source = audioCtx.createMediaStreamSource(micStream);
   source.connect(workletNode);
 
@@ -366,8 +391,6 @@ async function start() {
 
 async function stop() {
   running = false;
-
-  // IMPORTANT: clear timer first to stop ASR calls immediately
   if (stepTimer) { clearInterval(stepTimer); stepTimer = null; }
 
   setMic(false);
@@ -382,21 +405,25 @@ async function stop() {
 
 async function tick() {
   if (!running || inFlight || speaking) return;
-  if (!ring || haveSamples < ring.length) return; // need full window
+  if (!ring || haveSamples < ring.length) return;
 
   inFlight = true;
   try {
     setASR("decoding…");
 
-    const windowAudio = getWindow(); // Float32Array guaranteed
-    typeLine.textContent = `ASR input: ${windowAudio.constructor.name} len=${windowAudio.length}`;
+    const nativeWindow = getNativeWindow(); // Float32Array @ NATIVE_SR
+    const windowAudio = resampleLinear(nativeWindow, NATIVE_SR, ASR_SR); // Float32Array @ 16k
 
-    // ✅ Correct transformers.js signature: audio array first, options second
-    const result = await asr(windowAudio, { sampling_rate: TARGET_SR });
+    typeLine.textContent = `ASR input: ${windowAudio.constructor.name} len=${windowAudio.length} (from ${NATIVE_SR}→${ASR_SR})`;
 
+    // Correct signature: audio array first
+    const result = await asr(windowAudio, { sampling_rate: ASR_SR });
     const text = (result?.text || "").trim();
 
-    if (text && text !== lastPartial) {
+    // ignore pure blank audio tokens
+    const meaningful = text && text !== "[BLANK_AUDIO]" && text !== "[blank_audio]";
+
+    if (meaningful && text !== lastPartial) {
       lastPartial = text;
       liveEl.textContent = text;
     }
@@ -404,7 +431,8 @@ async function tick() {
     const now = performance.now();
     const quietLongEnough = lastHeardAt && (now - lastHeardAt) > SILENCE_MS_TO_FINAL;
 
-    if (quietLongEnough && lastPartial && lastPartial.length >= 6) {
+    // Only finalize if we actually heard non-trivial text
+    if (quietLongEnough && meaningful && lastPartial.length >= 6) {
       const finalText = lastPartial;
       log("Final: " + finalText);
 
@@ -412,7 +440,6 @@ async function tick() {
       replyEl.textContent = r;
       speakFast(r);
 
-      // reset for next utterance
       lastPartial = "";
       liveEl.textContent = "—";
       lastHeardAt = 0;
