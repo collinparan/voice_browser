@@ -318,7 +318,7 @@ async function tick() {
   try {
     setASR("decoding…");
     const windowAudio = getWindow();
-    const result = await asr({ audio: windowAudio, sampling_rate: TARGET_SR });
+    const result = await asr(windowAudio, { sampling_rate: TARGET_SR });
     const text = (result?.text || "").trim();
 
     if (text && text !== lastPartial) {
