@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Ultra-fast WebGPU Voice (Whisper + Native TTS)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    :root{ --glass: rgba(0,0,0,.52); --blur: 12px; --radius: 16px; --accent:#3fb950; --muted:#c9c9c9; --danger:#e5534b; }
+    *{ box-sizing:border-box; }
+    html,body{ margin:0; height:100%; background:#0f1115; color:#fff; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+    .bg{ position:fixed; inset:0;
+      background:
+        radial-gradient(1200px 700px at 20% 20%, rgba(63,185,80,.16), transparent 60%),
+        radial-gradient(900px 600px at 80% 40%, rgba(229,83,75,.10), transparent 55%),
+        radial-gradient(1000px 800px at 50% 90%, rgba(120,160,255,.08), transparent 60%),
+        #0f1115;
+    }
+    .topbar{ position:fixed; top:12px; left:16px; right:16px; display:flex; align-items:center; gap:10px; z-index:5; }
+    .chip{ display:inline-flex; align-items:center; gap:8px; background:var(--glass); backdrop-filter:blur(var(--blur));
+      border-radius:999px; padding:8px 12px; font-weight:800; box-shadow:0 4px 30px rgba(0,0,0,.25); }
+    .dot{ width:8px; height:8px; border-radius:50%; background:var(--muted); }
+    .spacer{ flex:1; }
+    .btn{ border:none; color:#111; font-weight:900; cursor:pointer; padding:10px 14px; border-radius:999px; background:#c5c7cf; opacity:.92; }
+    .btn.primary{ background:#b9f7c6; }
+    .btn.danger{ background:#f0b6c0; }
+    .btn:disabled{ opacity:.5; cursor:not-allowed; }
+
+    #left{ position:fixed; left:24px; bottom:24px; display:flex; flex-direction:column; gap:14px; max-width:560px; z-index:4; }
+    #right{ position:fixed; right:24px; bottom:24px; width:min(600px,46vw); display:flex; flex-direction:column; gap:14px; z-index:4; }
+    .panel{ background:var(--glass); backdrop-filter:blur(var(--blur)); border-radius:var(--radius); padding:16px 18px; color:#fff;
+      box-shadow:0 4px 30px rgba(0,0,0,.25); }
+    .panel h4{ margin:0 0 10px 0; opacity:.92; letter-spacing:.2px; font-weight:950; }
+    .small{ font-size:12px; opacity:.85; line-height:1.35; }
+    .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    #log{ white-space:pre-wrap; max-height:22vh; overflow:auto; font-size:13px; opacity:.95; }
+    .big{ font-size:16px; line-height:1.4; white-space:pre-wrap; }
+    .row{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .pill{ display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px;
+      border:1px solid rgba(255,255,255,.16); background:rgba(255,255,255,.06); font-weight:900; font-size:12px; opacity:.95; }
+    @media (max-width:900px){ #left{ max-width:420px; } #right{ width: calc(100vw - 48px);} }
+  </style>
+
+  <script type="importmap">
+  { "imports": { "@huggingface/transformers": "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2" } }
+  </script>
+</head>
+<body>
+  <div class="bg"></div>
+
+  <div class="topbar">
+    <div class="chip"><span class="dot" id="gpuDot"></span> <span id="gpuLabel">WebGPU: checking…</span></div>
+    <div class="chip"><span class="dot" id="micDot"></span> <span id="micLabel">Mic: idle</span></div>
+    <div class="chip"><span class="dot" id="asrDot"></span> <span id="asrLabel">ASR: idle</span></div>
+    <div class="chip"><span class="dot" id="ttsDot"></span> <span id="ttsLabel">TTS: idle</span></div>
+    <div class="spacer"></div>
+    <button id="initBtn" class="btn">Init</button>
+    <button id="listenBtn" class="btn primary" disabled>Start</button>
+    <button id="stopBtn" class="btn danger" disabled>Stop</button>
+  </div>
+
+  <div id="left">
+    <div class="panel">
+      <h4>Speed-first settings</h4>
+      <div class="row">
+        <span class="pill">ASR: <span class="mono">whisper-tiny.en</span></span>
+        <span class="pill">Window: <span class="mono" id="winLabel">0.8s</span></span>
+        <span class="pill">Step: <span class="mono" id="stepLabel">300ms</span></span>
+        <span class="pill">TTS: <span class="mono">speechSynthesis</span></span>
+      </div>
+      <div class="small" style="margin-top:10px">
+        This uses rolling-window Whisper for partial text, then responds with ultra-fast native TTS.
+        This is the lowest perceived latency you’ll get in-browser on Chrome/Mac.
+      </div>
+    </div>
+
+    <div class="panel">
+      <h4>Debug Log</h4>
+      <div id="log" class="mono">Ready.</div>
+    </div>
+  </div>
+
+  <div id="right">
+    <div class="panel">
+      <h4>Live transcript</h4>
+      <div id="live" class="big">—</div>
+      <div class="small">Updates while you speak.</div>
+    </div>
+    <div class="panel">
+      <h4>Assistant reply</h4>
+      <div id="reply" class="big">—</div>
+      <div class="small">Spoken immediately using the OS voice.</div>
+    </div>
+  </div>
+
+<script type="module">
+import { pipeline, env } from "@huggingface/transformers";
+
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+const liveEl = $("live");
+const replyEl = $("reply");
+
+const gpuDot = $("gpuDot"), gpuLabel = $("gpuLabel");
+const micDot = $("micDot"), micLabel = $("micLabel");
+const asrDot = $("asrDot"), asrLabel = $("asrLabel");
+const ttsDot = $("ttsDot"), ttsLabel = $("ttsLabel");
+
+const initBtn = $("initBtn");
+const listenBtn = $("listenBtn");
+const stopBtn = $("stopBtn");
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
+}
+function dot(dotEl, on) { dotEl.style.background = on ? "#3fb950" : "#c9c9c9"; }
+function setGPU(ok){ dot(gpuDot, ok); gpuLabel.textContent = ok ? "WebGPU: available" : "WebGPU: not available"; }
+function setMic(on){ dot(micDot, on); micLabel.textContent = on ? "Mic: capturing" : "Mic: idle"; }
+function setASR(state){ dot(asrDot, state !== "idle"); asrLabel.textContent = `ASR: ${state}`; }
+function setTTS(state){ dot(ttsDot, state !== "idle"); ttsLabel.textContent = `TTS: ${state}`; }
+
+const webgpuOK = ("gpu" in navigator);
+setGPU(webgpuOK);
+
+env.allowLocalModels = false;
+
+let asr = null;
+
+// --- Speed knobs ---
+const TARGET_SR = 16000;
+const WINDOW_SEC = 0.8;
+const STEP_MS = 300;
+const SILENCE_MS_TO_FINAL = 650;     // tighter -> faster finalize
+const MIN_FINAL_CHARS = 6;           // avoid speaking on accidental noise
+
+$("winLabel").textContent = `${WINDOW_SEC.toFixed(1)}s`;
+$("stepLabel").textContent = `${STEP_MS}ms`;
+
+// --- Audio capture ---
+let audioCtx = null;
+let workletNode = null;
+let micStream = null;
+
+let ring = new Float32Array(Math.ceil(TARGET_SR * WINDOW_SEC));
+let ringWrite = 0;
+let haveSamples = 0;
+
+let lastHeardAt = 0;
+let lastPartial = "";
+let running = false;
+let stepTimer = null;
+let inFlight = false;
+let speaking = false;
+
+// crude VAD
+function rms(buf) {
+  let s = 0;
+  for (let i = 0; i < buf.length; i++) s += buf[i]*buf[i];
+  return Math.sqrt(s / buf.length);
+}
+function getWindow() {
+  const out = new Float32Array(ring.length);
+  const len = ring.length;
+  const start = (ringWrite - len + ring.length) % ring.length;
+  for (let i = 0; i < len; i++) out[i] = ring[(start + i) % ring.length];
+  return out;
+}
+function clearState() {
+  ring.fill(0);
+  ringWrite = 0;
+  haveSamples = 0;
+  lastHeardAt = 0;
+  lastPartial = "";
+  liveEl.textContent = "—";
+  replyEl.textContent = "—";
+}
+
+function stopAllSpeech() {
+  try { speechSynthesis.cancel(); } catch {}
+  speaking = false;
+  setTTS("idle");
+}
+
+function speakFast(text) {
+  stopAllSpeech();
+  if (!text) return;
+
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1.12;      // faster without sounding too chipmunk
+  u.pitch = 1.0;
+  u.volume = 1.0;
+
+  // pick an English voice if available
+  const voices = speechSynthesis.getVoices?.() || [];
+  const v = voices.find(v => /en-US|en_US|English/i.test(v.lang || v.name)) || voices[0];
+  if (v) u.voice = v;
+
+  u.onstart = () => { speaking = true; setTTS("speaking"); };
+  u.onend = () => { speaking = false; setTTS("idle"); };
+  u.onerror = () => { speaking = false; setTTS("idle"); };
+
+  speechSynthesis.speak(u);
+}
+
+// ultra-fast “brain”: intent-ish rules (no LLM)
+function respond(text) {
+  const t = (text || "").trim();
+  if (!t) return "I didn’t catch that.";
+  const low = t.toLowerCase();
+
+  if (low.includes("hello") || low.includes("hey")) return "Hey. What’s up?";
+  if (low.includes("time")) return `It’s ${new Date().toLocaleTimeString()}.`;
+  if (low.includes("weather")) return "If you want weather, tell me your city.";
+  if (low.startsWith("open")) return "Tell me what you want to open.";
+  if (low.includes("stop")) return "Okay. Stopping.";
+
+  // default: echo + short acknowledgement (keeps it snappy)
+  if (t.length <= 60) return `Got it: ${t}`;
+  return "Got it.";
+}
+
+async function initModels() {
+  initBtn.disabled = true;
+  try {
+    setASR("loading…");
+    asr = await pipeline(
+      "automatic-speech-recognition",
+      "onnx-community/whisper-tiny.en",
+      { device: webgpuOK ? "webgpu" : "wasm" }
+    );
+    setASR("ready");
+    log("ASR ready (whisper-tiny.en).");
+    listenBtn.disabled = false;
+    stopBtn.disabled = false;
+
+    // warm speech synthesis voices
+    try { speechSynthesis.getVoices(); } catch {}
+    setTTS("idle");
+  } catch (e) {
+    log("Init error: " + (e?.message || e));
+    initBtn.disabled = false;
+    setASR("idle");
+  }
+}
+
+async function ensureAudioWorklet() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: TARGET_SR });
+
+  const code = `
+    class Capture extends AudioWorkletProcessor {
+      process(inputs) {
+        const input = inputs[0];
+        if (input && input[0]) this.port.postMessage(input[0].slice(0));
+        return true;
+      }
+    }
+    registerProcessor('capture', Capture);
+  `;
+  const url = URL.createObjectURL(new Blob([code], { type: "application/javascript" }));
+  await audioCtx.audioWorklet.addModule(url);
+  URL.revokeObjectURL(url);
+
+  workletNode = new AudioWorkletNode(audioCtx, "capture");
+  workletNode.port.onmessage = (e) => {
+    if (!running) return;
+    const frame = e.data;
+
+    for (let i = 0; i < frame.length; i++) {
+      ring[ringWrite] = frame[i];
+      ringWrite = (ringWrite + 1) % ring.length;
+    }
+    haveSamples = Math.min(ring.length, haveSamples + frame.length);
+
+    if (rms(frame) > 0.015) lastHeardAt = performance.now();
+  };
+
+  log("AudioWorklet ready @16kHz.");
+}
+
+async function start() {
+  if (!asr) return;
+  if (running) return;
+
+  await ensureAudioWorklet();
+  if (audioCtx.state !== "running") await audioCtx.resume();
+
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }
+  });
+  const source = audioCtx.createMediaStreamSource(micStream);
+  source.connect(workletNode);
+
+  clearState();
+  running = true;
+  setMic(true);
+  setASR("listening…");
+  log("Started.");
+
+  stepTimer = setInterval(tick, STEP_MS);
+}
+
+async function stop() {
+  running = false;
+  setMic(false);
+  setASR("idle");
+  if (stepTimer) { clearInterval(stepTimer); stepTimer = null; }
+  try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch {}
+  micStream = null;
+  stopAllSpeech();
+  log("Stopped.");
+}
+
+async function tick() {
+  if (!running || inFlight || haveSamples < ring.length || speaking) return;
+  inFlight = true;
+
+  try {
+    setASR("decoding…");
+    const windowAudio = getWindow();
+    const result = await asr({ audio: windowAudio, sampling_rate: TARGET_SR });
+    const text = (result?.text || "").trim();
+
+    if (text && text !== lastPartial) {
+      lastPartial = text;
+      liveEl.textContent = text;
+    }
+
+    const now = performance.now();
+    const quietLongEnough = lastHeardAt && (now - lastHeardAt) > SILENCE_MS_TO_FINAL;
+
+    if (quietLongEnough && lastPartial && lastPartial.length >= MIN_FINAL_CHARS) {
+      const finalText = lastPartial;
+      log("Final: " + finalText);
+
+      setASR("ready");
+      const r = respond(finalText);
+      replyEl.textContent = r;
+
+      speakFast(r);
+
+      // reset for next utterance
+      lastPartial = "";
+      liveEl.textContent = "—";
+      lastHeardAt = 0;
+      setASR("listening…");
+    } else {
+      setASR("listening…");
+    }
+  } catch (e) {
+    log("ASR error: " + (e?.message || e));
+    setASR("listening…");
+  } finally {
+    inFlight = false;
+  }
+}
+
+initBtn.onclick = initModels;
+listenBtn.onclick = start;
+stopBtn.onclick = stop;
+
+window.addEventListener("beforeunload", () => { try{ stop(); }catch{} });
+
+log("Click Init, then Start.");
+</script>
+</body>
+</html>
